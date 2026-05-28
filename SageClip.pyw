@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 SageClip - Portable clipboard manager.
-- Data saved alongside script (portable)
-- System tray with 5 recent entries (click to copy)
-- Dark theme, right-click context menu, text-only capture, dedup
+Inline editing in the detail pane. No popup dialogs.
+Dark theme. System tray. Text-only capture. Deduplication.
 
 Dependencies:  pip install pystray pillow
 """
@@ -19,21 +18,19 @@ import threading
 import re
 
 # ── Portable paths ─────────────────────────────────────────────────────────────
-# Always resolve relative to the script itself, regardless of cwd or shortcut location.
 
 if getattr(sys, "frozen", False):
-    # Running as a PyInstaller bundle
     SCRIPT_DIR = os.path.dirname(sys.executable)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DATA_FILE = os.path.join(SCRIPT_DIR, "sageclip_data.json")
 
-# ── Tray support ───────────────────────────────────────────────────────────────
+# ── Tray ───────────────────────────────────────────────────────────────────────
 
 try:
     import pystray
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
     TRAY_OK = True
 except ImportError:
     TRAY_OK = False
@@ -82,31 +79,24 @@ T = {
 def _make_tray_image(size=64):
     img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    draw.rounded_rectangle([2, 2, size - 2, size - 2], radius=12,
-                            fill=(79, 152, 163, 255))
-    bw, bh = int(size * 0.52), int(size * 0.62)
-    bx = (size - bw) // 2
-    by = int(size * 0.26)
-    draw.rectangle([bx, by, bx + bw, by + bh], fill=(255, 255, 255, 220))
-    cw = int(bw * 0.48)
-    cx = (size - cw) // 2
-    draw.rectangle([cx, by - int(size * 0.08), cx + cw, by + int(size * 0.06)],
-                   fill=(79, 152, 163, 255))
-    draw.rectangle([cx + 2, by - int(size * 0.06), cx + cw - 2, by + int(size * 0.04)],
-                   fill=(200, 240, 245, 255))
-    lx1 = bx + int(bw * 0.18)
-    lx2 = bx + int(bw * 0.82)
-    for frac in [0.38, 0.52, 0.66]:
-        ly = by + int(bh * frac)
-        draw.rectangle([lx1, ly, lx2, ly + 2], fill=(79, 152, 163, 180))
+    draw.rounded_rectangle([2, 2, size-2, size-2], radius=12, fill=(79,152,163,255))
+    bw, bh = int(size*.52), int(size*.62)
+    bx = (size-bw)//2
+    by = int(size*.26)
+    draw.rectangle([bx, by, bx+bw, by+bh], fill=(255,255,255,220))
+    cw = int(bw*.48)
+    cx = (size-cw)//2
+    draw.rectangle([cx, by-int(size*.08), cx+cw, by+int(size*.06)], fill=(79,152,163,255))
+    draw.rectangle([cx+2, by-int(size*.06), cx+cw-2, by+int(size*.04)], fill=(200,240,245,255))
+    lx1 = bx+int(bw*.18); lx2 = bx+int(bw*.82)
+    for frac in [.38,.52,.66]:
+        ly = by+int(bh*frac)
+        draw.rectangle([lx1,ly,lx2,ly+2], fill=(79,152,163,180))
     return img
 
 def _clip_label(text, max_chars=42):
-    """Single-line preview, clipped to max_chars."""
     s = " ".join(text.split())
-    if len(s) > max_chars:
-        s = s[:max_chars - 1] + "…"
-    return s if s else "(empty)"
+    return (s[:max_chars-1]+"…" if len(s)>max_chars else s) if s else "(empty)"
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
@@ -125,6 +115,7 @@ class SageClip(tk.Tk):
         self.search_var = tk.StringVar()
         self.fav_var    = tk.BooleanVar(value=False)
         self._tray_icon = None
+        self._editing   = False   # are we in inline edit mode?
 
         self._setup_style()
         self._build()
@@ -142,72 +133,51 @@ class SageClip(tk.Tk):
                     bordercolor=T["border"], arrowcolor=T["muted"])
 
     def _bg_deep(self, widget, color):
-        try:
-            widget.configure(bg=color)
-        except Exception:
-            pass
+        try: widget.configure(bg=color)
+        except Exception: pass
         for c in widget.winfo_children():
             self._bg_deep(c, color)
 
     # ── tray ───────────────────────────────────────────────────────────────────
 
     def _build_tray_menu(self):
-        """Rebuild tray menu each time so recent entries are current."""
         items = []
-
-        # 5 most recent entries (newest last in list → reversed)
         recent = list(reversed(self.entries))[:5]
         if recent:
             for entry in recent:
                 label = _clip_label(entry["text"], 42)
-                # capture entry id in closure
-                def make_copy_fn(eid):
+                def make_fn(eid):
                     def fn(icon, item):
-                        e = next((x for x in self.entries if x["id"] == eid), None)
-                        if e:
-                            # Must run clipboard on main thread
-                            self.after(0, lambda t=e["text"]: self._copy_text_silent(t))
+                        e = next((x for x in self.entries if x["id"]==eid), None)
+                        if e: self.after(0, lambda t=e["text"]: self._copy_text_silent(t))
                     return fn
-                items.append(pystray.MenuItem(label, make_copy_fn(entry["id"])))
+                items.append(pystray.MenuItem(label, make_fn(entry["id"])))
             items.append(pystray.Menu.SEPARATOR)
-
         items.append(pystray.MenuItem("📋  Open SageClip", self._restore_from_tray, default=True))
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("✕  Quit", self._quit_from_tray))
         return pystray.Menu(*items)
 
     def _copy_text_silent(self, text):
-        """Copy text to clipboard without triggering the monitor capture."""
-        self.last_clip = text   # pre-empt the monitor
+        self.last_clip = text
         self.clipboard_clear()
         self.clipboard_append(text)
 
     def _minimise_to_tray(self):
         if not TRAY_OK:
-            self._on_close()
-            return
+            self._on_close(); return
         self.withdraw()
         if self._tray_icon is not None:
-            # Rebuild menu with latest entries
-            self._tray_icon.menu = self._build_tray_menu()
-            return
+            self._tray_icon.menu = self._build_tray_menu(); return
         img = _make_tray_image()
-        self._tray_icon = pystray.Icon(
-            "SageClip", img, "SageClip", self._build_tray_menu()
-        )
-        t = threading.Thread(target=self._tray_icon.run, daemon=True)
-        t.start()
+        self._tray_icon = pystray.Icon("SageClip", img, "SageClip", self._build_tray_menu())
+        threading.Thread(target=self._tray_icon.run, daemon=True).start()
 
     def _restore_from_tray(self, icon=None, item=None):
         if self._tray_icon:
             self._tray_icon.stop()
             self._tray_icon = None
-        self.after(0, self._do_restore)
-
-    def _do_restore(self):
-        self.deiconify()
-        self.lift()
-        self.focus_force()
+        self.after(0, lambda: [self.deiconify(), self.lift(), self.focus_force()])
 
     def _quit_from_tray(self, icon=None, item=None):
         if self._tray_icon:
@@ -223,89 +193,87 @@ class SageClip(tk.Tk):
 
         # topbar
         bar = tk.Frame(self, bg=T["surface"], height=40)
-        bar.pack(fill="x")
-        bar.pack_propagate(False)
+        bar.pack(fill="x"); bar.pack_propagate(False)
 
         lf = tk.Frame(bar, bg=T["surface"])
         lf.pack(side="left", padx=12)
         tk.Label(lf, text="SC", bg=T["primary"], fg="#ffffff",
-                 font=("Aptos", 9, "bold"), width=3, pady=2).pack(side="left")
+                 font=("Aptos",9,"bold"), width=3, pady=2).pack(side="left")
         tk.Label(lf, text="  SageClip", bg=T["surface"], fg=T["primary"],
-                 font=("Aptos", 11, "bold")).pack(side="left")
+                 font=("Aptos",11,"bold")).pack(side="left")
 
         self.count_lbl = tk.Label(bar, text="0 entries",
                                    bg=T["surface3"], fg=T["muted"],
-                                   font=("Aptos", 8), padx=8, pady=2)
+                                   font=("Aptos",8), padx=8, pady=2)
         self.count_lbl.pack(side="right", padx=8)
 
         self.status_lbl = tk.Label(bar, text="● Monitoring",
                                     bg=T["surface"], fg=T["success"],
-                                    font=("Aptos", 8))
+                                    font=("Aptos",8))
         self.status_lbl.pack(side="right", padx=6)
 
         if TRAY_OK:
             tk.Button(bar, text="⌁ Tray",
-                      bg=T["surface"], fg=T["muted"],
-                      relief="flat", font=("Aptos", 8),
-                      bd=0, padx=8, pady=6, cursor="hand2",
-                      activebackground=T["surface3"],
-                      activeforeground=T["text"],
+                      bg=T["surface"], fg=T["muted"], relief="flat",
+                      font=("Aptos",8), bd=0, padx=8, pady=6, cursor="hand2",
+                      activebackground=T["surface3"], activeforeground=T["text"],
                       command=self._minimise_to_tray).pack(side="right", padx=4)
         else:
-            tk.Label(bar, text="pip install pystray pillow  for tray",
+            tk.Label(bar, text="pip install pystray pillow",
                      bg=T["surface"], fg=T["faint"],
-                     font=("Aptos", 7)).pack(side="right", padx=8)
+                     font=("Aptos",7)).pack(side="right", padx=8)
 
         tk.Frame(self, bg=T["border"], height=1).pack(fill="x")
 
-        # main layout
         main = tk.Frame(self, bg=T["bg"])
         main.pack(fill="both", expand=True)
 
+        # left panel
         left = tk.Frame(main, bg=T["surface"], width=280)
-        left.pack(side="left", fill="y")
-        left.pack_propagate(False)
+        left.pack(side="left", fill="y"); left.pack_propagate(False)
         tk.Frame(main, bg=T["border"], width=1).pack(side="left", fill="y")
 
         # search
         sf = tk.Frame(left, bg=T["surface"], padx=8, pady=7)
         sf.pack(fill="x")
-        si = tk.Frame(sf, bg=T["surface2"],
-                      highlightthickness=1,
-                      highlightbackground=T["border"],
-                      highlightcolor=T["primary"])
+        si = tk.Frame(sf, bg=T["surface2"], highlightthickness=1,
+                      highlightbackground=T["border"], highlightcolor=T["primary"])
         si.pack(fill="x")
         tk.Label(si, text="🔍", bg=T["surface2"], fg=T["muted"],
-                 font=("Aptos", 10), padx=4).pack(side="left")
+                 font=("Aptos",10), padx=4).pack(side="left")
         self.search_entry = tk.Entry(si, textvariable=self.search_var,
                                       bg=T["surface2"], fg=T["text"],
                                       insertbackground=T["text"],
-                                      relief="flat", font=("Aptos", 10),
+                                      relief="flat", font=("Aptos",10),
                                       highlightthickness=0)
-        self.search_entry.pack(side="left", fill="x", expand=True, pady=5, padx=(0, 6))
+        self.search_entry.pack(side="left", fill="x", expand=True, pady=5, padx=(0,6))
         self.search_entry.bind("<KeyRelease>", lambda e: self._refresh_list())
 
-        # filter row
+        # filter / delete row
         ff = tk.Frame(left, bg=T["surface"], padx=8)
         ff.pack(fill="x")
-        self.fav_chk = tk.Checkbutton(ff, text="★ Favourites",
+        self.fav_chk = tk.Checkbutton(ff, text="★ Favs",
                                        variable=self.fav_var,
                                        bg=T["surface"], fg=T["muted"],
                                        selectcolor=T["surface3"],
                                        activebackground=T["surface"],
-                                       font=("Aptos", 9), cursor="hand2",
+                                       font=("Aptos",9), cursor="hand2",
                                        command=self._refresh_list)
         self.fav_chk.pack(side="left")
         tk.Button(ff, text="Clear", bg=T["surface"], fg=T["faint"],
-                  relief="flat", font=("Aptos", 9), bd=0, padx=3,
+                  relief="flat", font=("Aptos",9), bd=0, padx=3,
                   cursor="hand2", activebackground=T["surface3"],
                   command=self._clear_search).pack(side="right")
         tk.Button(ff, text="🗑 All", bg=T["surface"], fg=T["error"],
-                  relief="flat", font=("Aptos", 9), bd=0, padx=3,
+                  relief="flat", font=("Aptos",9), bd=0, padx=3,
                   cursor="hand2", activebackground=T["surface3"],
-                  command=self._delete_all).pack(side="right", padx=(0, 4))
+                  command=self._delete_all).pack(side="right", padx=(0,4))
+        tk.Button(ff, text="🗑 Non-Fav", bg=T["surface"], fg=T["muted"],
+                  relief="flat", font=("Aptos",9), bd=0, padx=3,
+                  cursor="hand2", activebackground=T["surface3"],
+                  command=self._delete_non_favs).pack(side="right", padx=(0,4))
 
-        tk.Frame(left, bg=T["border"], height=1).pack(fill="x", pady=(4, 0))
+        tk.Frame(left, bg=T["border"], height=1).pack(fill="x", pady=(4,0))
 
         # scrollable list
         lf2 = tk.Frame(left, bg=T["surface"])
@@ -316,13 +284,13 @@ class SageClip(tk.Tk):
         vsb.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
         self.list_frame = tk.Frame(self.canvas, bg=T["surface"])
-        self._cwin = self.canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
+        self._cwin = self.canvas.create_window((0,0), window=self.list_frame, anchor="nw")
         self.list_frame.bind("<Configure>",
             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.bind("<Configure>",
             lambda e: self.canvas.itemconfig(self._cwin, width=e.width))
         self.canvas.bind_all("<MouseWheel>",
-            lambda e: self.canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+            lambda e: self.canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
 
         # right panel
         right = tk.Frame(main, bg=T["bg"])
@@ -330,64 +298,96 @@ class SageClip(tk.Tk):
         self._build_detail(right)
 
     def _build_detail(self, parent):
+        # ── header row ────────────────────────────────────────────────────────
         dh = tk.Frame(parent, bg=T["bg"], pady=9, padx=14)
         dh.pack(fill="x")
         tk.Label(dh, text="Entry Detail", bg=T["bg"], fg=T["text"],
-                 font=("Aptos", 11, "bold")).pack(side="left")
+                 font=("Aptos",11,"bold")).pack(side="left")
 
-        br = tk.Frame(dh, bg=T["bg"])
-        br.pack(side="right")
+        # VIEW mode buttons
+        self.view_btns = tk.Frame(dh, bg=T["bg"])
+        self.view_btns.pack(side="right")
 
-        self.fav_btn = tk.Button(br, text="☆ Fav",
+        self.fav_btn = tk.Button(self.view_btns, text="☆ Fav",
                                   bg=T["surface3"], fg=T["text"],
-                                  font=("Aptos", 9), relief="flat",
+                                  font=("Aptos",9), relief="flat",
                                   padx=7, pady=3, cursor="hand2",
                                   activebackground=T["surface2"],
                                   command=self._toggle_fav)
-        self.fav_btn.pack(side="left", padx=(0, 4))
+        self.fav_btn.pack(side="left", padx=(0,4))
 
-        self.copy_btn = tk.Button(br, text="⎘ Copy",
+        self.copy_btn = tk.Button(self.view_btns, text="⎘ Copy",
                                    bg=T["primary"], fg="#ffffff",
-                                   font=("Aptos", 9, "bold"), relief="flat",
+                                   font=("Aptos",9,"bold"), relief="flat",
                                    padx=7, pady=3, cursor="hand2",
                                    activebackground=T["pri_dim"],
                                    command=self._copy_entry)
-        self.copy_btn.pack(side="left", padx=(0, 4))
+        self.copy_btn.pack(side="left", padx=(0,4))
 
-        self.edit_btn = tk.Button(br, text="✎ Edit",
+        self.edit_btn = tk.Button(self.view_btns, text="✎ Edit",
                                    bg=T["surface3"], fg=T["text"],
-                                   font=("Aptos", 9), relief="flat",
+                                   font=("Aptos",9), relief="flat",
                                    padx=7, pady=3, cursor="hand2",
                                    activebackground=T["surface2"],
-                                   command=self._edit_entry)
-        self.edit_btn.pack(side="left", padx=(0, 4))
+                                   command=self._start_edit)
+        self.edit_btn.pack(side="left", padx=(0,4))
 
-        self.del_btn = tk.Button(br, text="🗑 Delete",
+        self.del_btn = tk.Button(self.view_btns, text="🗑 Delete",
                                   bg=T["error"], fg="#ffffff",
-                                  font=("Aptos", 9), relief="flat",
+                                  font=("Aptos",9), relief="flat",
                                   padx=7, pady=3, cursor="hand2",
                                   activebackground=T["error"],
                                   command=self._delete_entry)
         self.del_btn.pack(side="left")
 
+        # EDIT mode buttons (hidden until editing)
+        self.edit_btns = tk.Frame(dh, bg=T["bg"])
+        # NOT packed yet — shown only during edit mode
+
+        self.save_btn = tk.Button(self.edit_btns, text="✔ Save",
+                                   bg=T["success"], fg="#ffffff",
+                                   font=("Aptos",9,"bold"), relief="flat",
+                                   padx=7, pady=3, cursor="hand2",
+                                   activebackground=T["success"],
+                                   command=self._save_edit)
+        self.save_btn.pack(side="left", padx=(0,4))
+
+        self.cancel_btn = tk.Button(self.edit_btns, text="✖ Cancel",
+                                     bg=T["surface3"], fg=T["text"],
+                                     font=("Aptos",9), relief="flat",
+                                     padx=7, pady=3, cursor="hand2",
+                                     activebackground=T["surface2"],
+                                     command=self._cancel_edit)
+        self.cancel_btn.pack(side="left")
+
+        self.edit_hint = tk.Label(self.edit_btns, text="Ctrl+S to save  ·  Esc to cancel",
+                                   bg=T["bg"], fg=T["faint"], font=("Aptos",8))
+        self.edit_hint.pack(side="left", padx=(10,0))
+
         tk.Frame(parent, bg=T["border"], height=1).pack(fill="x", padx=14)
 
+        # meta row
         mf = tk.Frame(parent, bg=T["bg"], padx=14, pady=6)
         mf.pack(fill="x")
-        self.ts_lbl = tk.Label(mf, text="Select an entry",
-                                bg=T["bg"], fg=T["muted"],
-                                font=("Aptos", 9))
+        self.ts_lbl = tk.Label(mf, text="Select an entry from the list",
+                                bg=T["bg"], fg=T["muted"], font=("Aptos",9))
         self.ts_lbl.pack(side="left")
         self.fav_badge = tk.Label(mf, text="★ Favourite",
                                    bg=T["fav_bg"], fg=T["gold"],
-                                   font=("Aptos", 8, "bold"), padx=6, pady=1)
+                                   font=("Aptos",8,"bold"), padx=6, pady=1)
 
+        # edit mode indicator label (hidden until editing)
+        self.editing_lbl = tk.Label(mf, text="✎ Editing…",
+                                     bg=T["bg"], fg=T["primary"],
+                                     font=("Aptos",8,"bold"))
+
+        # content text area
         cf = tk.Frame(parent, bg=T["surface2"],
                       highlightthickness=1, highlightbackground=T["border"])
-        cf.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        cf.pack(fill="both", expand=True, padx=14, pady=(0,8))
 
         self.detail_text = tk.Text(cf, bg=T["surface2"], fg=T["text"],
-                                    font=("Aptos Mono", 10), relief="flat",
+                                    font=("Aptos Mono",10), relief="flat",
                                     insertbackground=T["text"],
                                     selectbackground=T["sel_bg"],
                                     selectforeground=T["text"],
@@ -398,13 +398,67 @@ class SageClip(tk.Tk):
         ds.pack(side="right", fill="y")
         self.detail_text.pack(fill="both", expand=True)
 
-        # Data file path indicator at bottom
+        # Ctrl+S and Escape bindings on text widget
+        self.detail_text.bind("<Control-s>", lambda e: self._save_edit())
+        self.detail_text.bind("<Escape>",    lambda e: self._cancel_edit())
+
+        # data path footer
         path_bar = tk.Frame(parent, bg=T["bg"], padx=14, pady=2)
         path_bar.pack(fill="x")
-        tk.Label(path_bar, text="💾 Data: {}".format(DATA_FILE),
-                 bg=T["bg"], fg=T["faint"],
-                 font=("Aptos", 7),
-                 anchor="w").pack(fill="x")
+        tk.Label(path_bar, text="💾 {}".format(DATA_FILE),
+                 bg=T["bg"], fg=T["faint"], font=("Aptos",7), anchor="w").pack(fill="x")
+
+    # ── inline edit mode ───────────────────────────────────────────────────────
+
+    def _start_edit(self):
+        if not self.sel_id:
+            return
+        self._editing = True
+        # Swap button rows
+        self.view_btns.pack_forget()
+        self.edit_btns.pack(side="right")
+        # Show editing indicator
+        self.editing_lbl.pack(side="right", padx=(8,0))
+        # Make text widget editable
+        self.detail_text.configure(
+            state="normal",
+            bg=T["surface2"],
+            highlightthickness=1,
+            highlightbackground=T["primary"]
+        )
+        self.detail_text.focus_set()
+
+    def _save_edit(self):
+        if not self._editing or not self.sel_id:
+            return
+        new_text = self.detail_text.get("1.0", "end-1c")
+        live = next((e for e in self.entries if e["id"] == self.sel_id), None)
+        if live is not None:
+            live["text"] = new_text
+            save_data(self.entries)
+        self._end_edit()
+        self._refresh_list()
+        if live:
+            self._show_detail(live["id"])
+
+    def _cancel_edit(self):
+        if not self._editing:
+            return
+        self._end_edit()
+        # Restore original text
+        if self.sel_id:
+            self._show_detail(self.sel_id)
+
+    def _end_edit(self):
+        self._editing = False
+        self.edit_btns.pack_forget()
+        self.editing_lbl.pack_forget()
+        self.view_btns.pack(side="right")
+        self.detail_text.configure(
+            state="disabled",
+            highlightthickness=1,
+            highlightbackground=T["border"]
+        )
 
     # ── context menu ───────────────────────────────────────────────────────────
 
@@ -413,16 +467,15 @@ class SageClip(tk.Tk):
                        bg=T["surface2"], fg=T["text"],
                        activebackground=T["sel_bg"],
                        activeforeground=T["text"],
-                       font=("Aptos", 9),
-                       relief="flat", bd=1)
+                       font=("Aptos",9), relief="flat", bd=1)
         fav_label = "★ Unfavourite" if entry.get("fav") else "☆ Favourite"
         menu.add_command(label="⎘  Copy to Clipboard",
                          command=lambda: self._copy_by_id(entry["id"]))
         menu.add_separator()
         menu.add_command(label=fav_label,
                          command=lambda: self._toggle_fav_by_id(entry["id"]))
-        menu.add_command(label="✎  Edit",
-                         command=lambda: self._edit_by_id(entry["id"]))
+        menu.add_command(label="✎  Edit (inline)",
+                         command=lambda: [self._select_entry(entry["id"]), self._start_edit()])
         menu.add_separator()
         menu.add_command(label="🗑  Delete",
                          command=lambda: self._delete_by_id(entry["id"]))
@@ -430,6 +483,11 @@ class SageClip(tk.Tk):
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _select_entry(self, eid):
+        self.sel_id = eid
+        self._refresh_list()
+        self._show_detail(eid)
 
     # ── list rendering ─────────────────────────────────────────────────────────
 
@@ -439,10 +497,8 @@ class SageClip(tk.Tk):
 
         self.filtered = []
         for e in reversed(self.entries):
-            if fav_only and not e.get("fav"):
-                continue
-            if query and query not in e.get("text", "").lower():
-                continue
+            if fav_only and not e.get("fav"): continue
+            if query and query not in e.get("text","").lower(): continue
             self.filtered.append(e)
 
         for w in self.list_frame.winfo_children():
@@ -451,21 +507,20 @@ class SageClip(tk.Tk):
         if not self.filtered:
             ef = tk.Frame(self.list_frame, bg=T["surface"])
             ef.pack(fill="x", padx=12, pady=40)
-            tk.Label(ef, text="📭", bg=T["surface"],
-                     font=("Aptos", 22)).pack()
+            tk.Label(ef, text="📭", bg=T["surface"], font=("Aptos",22)).pack()
             msg = "No entries yet" if not self.entries else "No matches"
             sub = "Copy some text to get started." if not self.entries else "Try a different search."
             tk.Label(ef, text=msg, bg=T["surface"], fg=T["muted"],
-                     font=("Aptos", 10, "bold")).pack(pady=(6, 2))
+                     font=("Aptos",10,"bold")).pack(pady=(6,2))
             tk.Label(ef, text=sub, bg=T["surface"], fg=T["faint"],
-                     font=("Aptos", 9)).pack()
+                     font=("Aptos",9)).pack()
         else:
             for entry in self.filtered:
                 self._make_item(entry)
 
         total = len(self.entries)
         shown = len(self.filtered)
-        label = "{} / {} entries".format(shown, total) if (query or fav_only) \
+        label = "{} / {} entries".format(shown,total) if (query or fav_only) \
                 else "{} entries".format(total)
         self.count_lbl.configure(text=label)
 
@@ -486,40 +541,34 @@ class SageClip(tk.Tk):
         top_row = tk.Frame(inner, bg=bg)
         top_row.pack(fill="x")
 
-        ts_label = tk.Label(top_row, text=entry.get("timestamp", ""),
-                            bg=bg, fg=T["muted"], font=("Aptos", 8))
+        ts_label = tk.Label(top_row, text=entry.get("timestamp",""),
+                            bg=bg, fg=T["muted"], font=("Aptos",8))
         ts_label.pack(side="left")
         if is_fav:
             tk.Label(top_row, text="★", bg=bg, fg=T["gold"],
-                     font=("Aptos", 9)).pack(side="right")
+                     font=("Aptos",9)).pack(side="right")
 
-        raw     = entry.get("text", "")
+        raw = entry.get("text","")
         preview = " ".join(raw.split())
-        if len(preview) > 70:
-            preview = preview[:70] + "…"
+        if len(preview) > 70: preview = preview[:70]+"…"
 
         prev_lbl = tk.Label(inner,
                             text=preview if preview else "(empty)",
-                            bg=bg,
-                            fg=T["text"] if preview else T["faint"],
-                            font=("Aptos", 10),
-                            anchor="w", justify="left", wraplength=240)
-        prev_lbl.pack(fill="x", pady=(2, 0))
+                            bg=bg, fg=T["text"] if preview else T["faint"],
+                            font=("Aptos",10), anchor="w", justify="left", wraplength=240)
+        prev_lbl.pack(fill="x", pady=(2,0))
 
         def on_enter(e, f=item, orig=bg):
-            if entry["id"] != self.sel_id:
-                self._bg_deep(f, T["hover_bg"])
-
+            if entry["id"] != self.sel_id: self._bg_deep(f, T["hover_bg"])
         def on_leave(e, f=item, orig=bg):
-            if entry["id"] != self.sel_id:
-                self._bg_deep(f, orig)
-
+            if entry["id"] != self.sel_id: self._bg_deep(f, orig)
         def on_click(e, eid=entry["id"]):
+            if self._editing: self._cancel_edit()
             self.sel_id = eid
             self._refresh_list()
             self._show_detail(eid)
-
         def on_right(e, eid=entry["id"]):
+            if self._editing: self._cancel_edit()
             self.sel_id = eid
             self._refresh_list()
             self._show_detail(eid)
@@ -533,30 +582,32 @@ class SageClip(tk.Tk):
 
         tk.Frame(self.list_frame, bg=T["border"], height=1).pack(fill="x", padx=4)
 
-    # ── detail panel ───────────────────────────────────────────────────────────
+    # ── detail view ────────────────────────────────────────────────────────────
 
     def _show_detail(self, eid):
-        entry = next((e for e in self.entries if e["id"] == eid), None)
-        if not entry:
-            return
-        self.ts_lbl.configure(text="🕐  {}".format(entry.get("timestamp", "")))
+        if self._editing: return   # don't overwrite during active edit
+        entry = next((e for e in self.entries if e["id"]==eid), None)
+        if not entry: return
+
+        self.ts_lbl.configure(text="🕐  {}".format(entry.get("timestamp","")))
+
         if entry.get("fav"):
-            self.fav_badge.pack(side="left", padx=(10, 0))
+            self.fav_badge.pack(side="left", padx=(10,0))
             self.fav_btn.configure(text="★ Unfav", bg=T["gold"], fg="#1a1a14")
         else:
             self.fav_badge.pack_forget()
             self.fav_btn.configure(text="☆ Fav", bg=T["surface3"], fg=T["text"])
+
         self.detail_text.configure(state="normal")
         self.detail_text.delete("1.0", "end")
-        self.detail_text.insert("1.0", entry.get("text", ""))
+        self.detail_text.insert("1.0", entry.get("text",""))
         self.detail_text.configure(state="disabled")
 
     def _get_sel(self):
-        if not self.sel_id:
-            return None
-        return next((e for e in self.entries if e["id"] == self.sel_id), None)
+        if not self.sel_id: return None
+        return next((e for e in self.entries if e["id"]==self.sel_id), None)
 
-    # ── button dispatchers ─────────────────────────────────────────────────────
+    # ── view mode actions ──────────────────────────────────────────────────────
 
     def _toggle_fav(self):
         e = self._get_sel()
@@ -566,10 +617,6 @@ class SageClip(tk.Tk):
         e = self._get_sel()
         if e: self._copy_by_id(e["id"])
 
-    def _edit_entry(self):
-        e = self._get_sel()
-        if e: self._edit_by_id(e["id"])
-
     def _delete_entry(self):
         e = self._get_sel()
         if e: self._delete_by_id(e["id"])
@@ -577,7 +624,7 @@ class SageClip(tk.Tk):
     # ── id-based actions ───────────────────────────────────────────────────────
 
     def _toggle_fav_by_id(self, eid):
-        entry = next((e for e in self.entries if e["id"] == eid), None)
+        entry = next((e for e in self.entries if e["id"]==eid), None)
         if not entry: return
         entry["fav"] = not entry.get("fav", False)
         save_data(self.entries)
@@ -585,92 +632,62 @@ class SageClip(tk.Tk):
         self._show_detail(eid)
 
     def _copy_by_id(self, eid):
-        entry = next((e for e in self.entries if e["id"] == eid), None)
+        entry = next((e for e in self.entries if e["id"]==eid), None)
         if not entry: return
-        self._copy_text_silent(entry.get("text", ""))
+        self._copy_text_silent(entry.get("text",""))
         orig_text = self.copy_btn.cget("text")
         orig_bg   = self.copy_btn.cget("bg")
         self.copy_btn.configure(text="✓ Copied!", bg=T["success"])
         self.after(1400, lambda: self.copy_btn.configure(text=orig_text, bg=orig_bg))
 
-    def _edit_by_id(self, eid):
-        entry = next((e for e in self.entries if e["id"] == eid), None)
-        if not entry: return
-
-        dlg = tk.Toplevel(self)
-        dlg.title("Edit Entry")
-        dlg.geometry("500x340")
-        dlg.configure(bg=T["bg"])
-        dlg.transient(self)
-        dlg.grab_set()
-        dlg.resizable(True, True)
-
-        tk.Label(dlg, text="Edit entry content:",
-                 bg=T["bg"], fg=T["text"],
-                 font=("Aptos", 10, "bold")).pack(padx=14, pady=(12, 3), anchor="w")
-        tk.Label(dlg, text="Created: {}".format(entry.get("timestamp", "")),
-                 bg=T["bg"], fg=T["muted"],
-                 font=("Aptos", 9)).pack(padx=14, anchor="w")
-
-        tf = tk.Frame(dlg, bg=T["surface2"],
-                      highlightthickness=1, highlightbackground=T["border"])
-        tf.pack(fill="both", expand=True, padx=14, pady=8)
-
-        et = tk.Text(tf, bg=T["surface2"], fg=T["text"],
-                     font=("Aptos Mono", 10), relief="flat",
-                     insertbackground=T["text"],
-                     selectbackground=T["sel_bg"],
-                     wrap="word", padx=10, pady=8,
-                     highlightthickness=0)
-        es = ttk.Scrollbar(tf, orient="vertical", command=et.yview)
-        et.configure(yscrollcommand=es.set)
-        es.pack(side="right", fill="y")
-        et.pack(fill="both", expand=True)
-        et.insert("1.0", entry.get("text", ""))
-        et.focus_set()
-
-        brow = tk.Frame(dlg, bg=T["bg"])
-        brow.pack(fill="x", padx=14, pady=(0, 12))
-
-        def do_save():
-            entry["text"] = et.get("1.0", "end-1c")
-            save_data(self.entries)
-            self._refresh_list()
-            self._show_detail(entry["id"])
-            dlg.destroy()
-
-        tk.Button(brow, text="Save Changes",
-                  bg=T["primary"], fg="#ffffff",
-                  font=("Aptos", 10, "bold"), relief="flat",
-                  padx=10, pady=5, cursor="hand2",
-                  activebackground=T["pri_dim"],
-                  command=do_save).pack(side="left", padx=(0, 6))
-        tk.Button(brow, text="Cancel",
-                  bg=T["surface3"], fg=T["text"],
-                  font=("Aptos", 10), relief="flat",
-                  padx=10, pady=5, cursor="hand2",
-                  activebackground=T["surface2"],
-                  command=dlg.destroy).pack(side="left")
-
-        dlg.bind("<Escape>", lambda e: dlg.destroy())
-
     def _delete_by_id(self, eid):
-        entry = next((e for e in self.entries if e["id"] == eid), None)
+        entry = next((e for e in self.entries if e["id"]==eid), None)
         if not entry: return
-        raw     = entry.get("text", "")
-        preview = (raw[:55] + "...") if len(raw) > 55 else raw
+        raw = entry.get("text","")
+        preview = (raw[:55]+"...") if len(raw)>55 else raw
         if messagebox.askyesno("Delete Entry",
                                "Permanently delete this entry?\n\n\"{}\"".format(preview),
                                parent=self):
-            self.entries = [e for e in self.entries if e["id"] != eid]
+            self.entries = [e for e in self.entries if e["id"]!=eid]
             if self.sel_id == eid:
                 self.sel_id = None
                 self._clear_detail()
             save_data(self.entries)
             self._refresh_list()
 
+    def _delete_all(self):
+        if not self.entries: return
+        count = len(self.entries)
+        if messagebox.askyesno("Delete All Entries",
+                               "Permanently delete all {} entries? This cannot be undone.".format(count),
+                               parent=self):
+            self.entries = []
+            self.sel_id  = None
+            save_data(self.entries)
+            self._clear_detail()
+            self._refresh_list()
+
+    def _delete_non_favs(self):
+        non_favs = [e for e in self.entries if not e.get("fav")]
+        if not non_favs:
+            messagebox.showinfo("Nothing to delete",
+                                "All entries are favourited — nothing to remove.",
+                                parent=self)
+            return
+        count = len(non_favs)
+        if messagebox.askyesno("Delete Non-Favourites",
+                               "Permanently delete {} non-favourited entries?\nFavourited entries will be kept.".format(count),
+                               parent=self):
+            self.entries = [e for e in self.entries if e.get("fav")]
+            if self.sel_id and not any(e["id"]==self.sel_id for e in self.entries):
+                self.sel_id = None
+                self._clear_detail()
+            save_data(self.entries)
+            self._refresh_list()
+
     def _clear_detail(self):
-        self.ts_lbl.configure(text="Select an entry")
+        if self._editing: self._end_edit()
+        self.ts_lbl.configure(text="Select an entry from the list")
         self.fav_badge.pack_forget()
         self.fav_btn.configure(text="☆ Fav", bg=T["surface3"], fg=T["text"])
         self.detail_text.configure(state="normal")
@@ -680,22 +697,18 @@ class SageClip(tk.Tk):
     # ── clipboard monitor ──────────────────────────────────────────────────────
 
     def _start_monitor(self):
-        try:
-            self.last_clip = self.clipboard_get()
-        except Exception:
-            self.last_clip = ""
+        try: self.last_clip = self.clipboard_get()
+        except Exception: self.last_clip = ""
         self._poll()
 
     def _is_file_path(self, text):
         lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
-        if not lines:
-            return False
-        pat = re.compile(r'^(?:[a-zA-Z]:\\|\\\\|/)' r'|^\.{1,2}[/\\]')
+        if not lines: return False
+        pat = re.compile(r'^(?:[a-zA-Z]:\\|\\\\|/)|^\.{1,2}[/\\]')
         return all(pat.match(line) for line in lines)
 
     def _poll(self):
-        if not self.monitoring:
-            return
+        if not self.monitoring: return
         try:
             current = self.clipboard_get()
             if current and current.strip() and current != self.last_clip:
@@ -713,26 +726,18 @@ class SageClip(tk.Tk):
         new_id = str(int(time.time() * 1000))
 
         fav_state = False
-        if any(e.get("text") == text for e in self.entries):
-            old = next((e for e in self.entries if e.get("text") == text), None)
-            if old:
-                fav_state = old.get("fav", False)
-            self.entries = [e for e in self.entries if e.get("text") != text]
+        if any(e.get("text")==text for e in self.entries):
+            old = next((e for e in self.entries if e.get("text")==text), None)
+            if old: fav_state = old.get("fav", False)
+            self.entries = [e for e in self.entries if e.get("text")!=text]
 
-        self.entries.append({
-            "id":        new_id,
-            "text":      text,
-            "timestamp": now,
-            "fav":       fav_state,
-        })
+        self.entries.append({"id": new_id, "text": text,
+                              "timestamp": now, "fav": fav_state})
         save_data(self.entries)
 
-        # Keep tray menu fresh if it's open
         if self._tray_icon:
-            try:
-                self._tray_icon.menu = self._build_tray_menu()
-            except Exception:
-                pass
+            try: self._tray_icon.menu = self._build_tray_menu()
+            except Exception: pass
 
         self._refresh_list()
         self.status_lbl.configure(text="● Captured!", fg=T["primary"])
@@ -740,21 +745,6 @@ class SageClip(tk.Tk):
             text="● Monitoring", fg=T["success"]))
 
     # ── misc ───────────────────────────────────────────────────────────────────
-
-    def _delete_all(self):
-        if not self.entries:
-            return
-        count = len(self.entries)
-        if messagebox.askyesno(
-            "Delete All Entries",
-            "Permanently delete all {} entries? This cannot be undone.".format(count),
-            parent=self
-        ):
-            self.entries = []
-            self.sel_id  = None
-            save_data(self.entries)
-            self._clear_detail()
-            self._refresh_list()
 
     def _clear_search(self):
         self.search_var.set("")
@@ -765,8 +755,6 @@ class SageClip(tk.Tk):
         self.monitoring = False
         self.destroy()
 
-
-# ── entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     app = SageClip()
